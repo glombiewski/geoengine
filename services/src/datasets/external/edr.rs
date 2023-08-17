@@ -21,7 +21,7 @@ use geoengine_datatypes::primitives::{
 use geoengine_datatypes::raster::RasterDataType;
 use geoengine_datatypes::spatial_reference::{SpatialReference, SpatialReferenceOption};
 use geoengine_operators::engine::{
-    MetaData, MetaDataProvider, RasterOperator, RasterResultDescriptor, StaticMetaData,
+    MetaData, MetaDataProvider, RasterOperator, RasterResultDescriptor, ResultDescriptor,
     TypedOperator, VectorColumnInfo, VectorOperator, VectorResultDescriptor,
 };
 use geoengine_operators::mock::MockDatasetDataSourceLoadingInfo;
@@ -36,6 +36,9 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
 use std::collections::{BTreeMap, HashMap};
+use std::fmt::Debug;
+use std::marker::PhantomData;
+use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::OnceLock;
 use url::Url;
@@ -389,6 +392,7 @@ struct EdrCollectionMetaData {
     id: String,
     title: Option<String>,
     description: Option<String>,
+    keywords: Option<Vec<String>>,
     extent: EdrExtents,
     //for paging keys need to be returned in same order every time
     parameter_names: BTreeMap<String, EdrParameter>,
@@ -455,16 +459,6 @@ impl EdrCollectionMetaData {
         height: &str,
         discrete_vrs: &[String],
     ) -> Result<(String, String), geoengine_operators::error::Error> {
-        let spatial_extent = self.extent.spatial.as_ref().ok_or_else(|| {
-            geoengine_operators::error::Error::DatasetMetaData {
-                source: Box::new(EdrProviderError::MissingSpatialExtent),
-            }
-        })?;
-        let temporal_extent = self.extent.temporal.as_ref().ok_or_else(|| {
-            geoengine_operators::error::Error::DatasetMetaData {
-                source: Box::new(EdrProviderError::MissingTemporalExtent),
-            }
-        })?;
         let z = if height == "default" {
             String::new()
         } else if self.extent.has_discrete_vertical_axis(discrete_vrs) {
@@ -473,28 +467,13 @@ impl EdrCollectionMetaData {
             format!("&z={height}%2F{height}")
         };
         let download_url = format!(
-            "/vsicurl_streaming/{}collections/{}/cube?bbox={},{},{},{}{}&datetime={}%2F{}&f={}",
+            "/vsicurl_streaming/{}collections/{}/cube?f={}{}",
             base_url,
             self.id,
-            spatial_extent.bbox[0][0],
-            spatial_extent.bbox[0][1],
-            spatial_extent.bbox[0][2],
-            spatial_extent.bbox[0][3],
-            z,
-            temporal_extent.interval[0][0],
-            temporal_extent.interval[0][1],
-            self.select_output_format()?
+            self.select_output_format()?,
+            z
         );
-        let mut layer_name = format!(
-            "cube?bbox={},{},{},{}{}&datetime={}%2F{}",
-            spatial_extent.bbox[0][0],
-            spatial_extent.bbox[0][1],
-            spatial_extent.bbox[0][2],
-            spatial_extent.bbox[0][3],
-            z,
-            temporal_extent.interval[0][0],
-            temporal_extent.interval[0][1]
-        );
+        let mut layer_name = format!("cube?f={}{}", self.select_output_format()?, z);
         if let Some(last_dot_pos) = layer_name.rfind('.') {
             layer_name = layer_name[0..last_dot_pos].to_string();
         }
@@ -581,9 +560,31 @@ impl EdrCollectionMetaData {
             })
             .collect();
 
+        let vector_data_type = match &self.keywords {
+            None => VectorDataType::MultiPoint,
+            Some(kw) => {
+                let mut inner_res = None;
+                for keyword in kw {
+                    inner_res = match keyword.as_str() {
+                        "Point" => Some(VectorDataType::MultiPoint),
+                        "LineString" => Some(VectorDataType::MultiLineString),
+                        "Polygon" => Some(VectorDataType::MultiPolygon),
+                        "MultiPoint" => Some(VectorDataType::MultiPoint),
+                        "MultiLineString" => Some(VectorDataType::MultiLineString),
+                        "MultiPolygon" => Some(VectorDataType::MultiPolygon),
+                        _ => None,
+                    };
+                    if inner_res.is_some() {
+                        break;
+                    }
+                }
+                inner_res.unwrap_or(VectorDataType::MultiPoint)
+            }
+        };
+
         Ok(VectorResultDescriptor {
             spatial_reference: SpatialReference::epsg_4326().into(),
-            data_type: VectorDataType::MultiPoint,
+            data_type: vector_data_type,
             columns: column_map,
             time: Some(self.get_time_interval()?),
             bbox: Some(self.get_bounding_box()?),
@@ -638,7 +639,7 @@ impl EdrCollectionMetaData {
         OgrSourceDataset {
             file_name: download_url.into(),
             layer_name,
-            data_type: Some(VectorDataType::MultiPoint),
+            data_type: Some(VectorDataType::MultiLineString),
             time: OgrSourceDatasetTimeType::Start {
                 start_field: vector_spec.t.clone(),
                 start_format: OgrSourceTimeFormat::Auto,
@@ -662,15 +663,15 @@ impl EdrCollectionMetaData {
         vector_spec: EdrVectorSpec,
         cache_ttl: CacheTtlSeconds,
         discrete_vrs: &[String],
-    ) -> Result<StaticMetaData<OgrSourceDataset, VectorResultDescriptor, VectorQueryRectangle>>
-    {
+    ) -> Result<EdrMetaData<OgrSourceDataset, VectorResultDescriptor, VectorQueryRectangle>> {
         let (download_url, layer_name) =
             self.get_vector_download_url(base_url, height, discrete_vrs)?;
-        let omd = self.get_ogr_source_ds(download_url, layer_name, vector_spec, cache_ttl);
+        let omd = self.get_ogr_source_ds(download_url.clone(), layer_name, vector_spec, cache_ttl);
 
-        Ok(StaticMetaData {
+        Ok(EdrMetaData {
             loading_info: omd,
             result_descriptor: self.get_vector_result_descriptor()?,
+            template_url: download_url,
             phantom: Default::default(),
         })
     }
@@ -884,6 +885,103 @@ impl TryFrom<EdrCollectionId> for LayerId {
         };
 
         Ok(LayerId(s))
+    }
+}
+
+trait EDRLinkGenerator<Q>
+where
+    Q: Debug + Clone + Send + Sync + 'static,
+{
+    fn new_link(
+        &self,
+        template_url: &String,
+        query: Q,
+    ) -> std::result::Result<Self, geoengine_operators::error::Error>
+    where
+        Self: Sized;
+}
+
+impl EDRLinkGenerator<VectorQueryRectangle> for OgrSourceDataset {
+    fn new_link(
+        &self,
+        template_url: &String,
+        query: VectorQueryRectangle,
+    ) -> std::result::Result<Self, geoengine_operators::error::Error>
+    where
+        Self: Sized,
+    {
+        let start = query
+            .time_interval
+            .start()
+            .as_datetime_string()
+            .replace("+", "%2B");
+        let end = query
+            .time_interval
+            .end()
+            .as_datetime_string()
+            .replace("+", "%2B");
+        let query_rectangle = format!(
+            "&bbox={},{},{},{}&datetime={}%2F{}",
+            query.spatial_bounds.lower_left().x,
+            query.spatial_bounds.lower_left().y,
+            query.spatial_bounds.upper_right().x,
+            query.spatial_bounds.upper_left().y,
+            start,
+            end
+        );
+        let new_file_name = PathBuf::from(template_url.to_owned() + &query_rectangle);
+        let mut new_layer_name = self.layer_name.clone() + &query_rectangle;
+        if let Some(last_dot_pos) = new_layer_name.rfind('.') {
+            new_layer_name = new_layer_name[0..last_dot_pos].to_string();
+        }
+
+        Ok(Self {
+            file_name: new_file_name,
+            layer_name: new_layer_name,
+            data_type: self.data_type,
+            time: self.time.clone(),
+            default_geometry: self.default_geometry.clone(),
+            columns: self.columns.clone(),
+            force_ogr_time_filter: self.force_ogr_time_filter,
+            force_ogr_spatial_filter: self.force_ogr_spatial_filter,
+            on_error: self.on_error,
+            sql_query: self.sql_query.clone(),
+            attribute_query: self.attribute_query.clone(),
+            cache_ttl: self.cache_ttl,
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+struct EdrMetaData<L, R, Q>
+where
+    L: Debug + Clone + Send + Sync + EDRLinkGenerator<Q> + 'static,
+    R: Debug + Send + Sync + 'static + ResultDescriptor,
+    Q: Debug + Clone + Send + Sync + 'static,
+{
+    pub loading_info: L,
+    pub result_descriptor: R,
+    pub template_url: String,
+    pub phantom: PhantomData<Q>,
+}
+
+#[async_trait::async_trait]
+impl<L, R, Q> MetaData<L, R, Q> for EdrMetaData<L, R, Q>
+where
+    L: Debug + Clone + Send + Sync + EDRLinkGenerator<Q> + 'static,
+    R: Debug + Send + Sync + 'static + ResultDescriptor,
+    Q: Debug + Clone + Send + Sync + 'static,
+{
+    async fn loading_info(&self, query: Q) -> geoengine_operators::util::Result<L> {
+        self.loading_info.new_link(&self.template_url, query)
+    }
+
+    async fn result_descriptor(&self) -> geoengine_operators::util::Result<R> {
+        Ok(self.result_descriptor.clone())
+    }
+
+    fn box_clone(&self) -> Box<dyn MetaData<L, R, Q>> {
+        Box::new(self.clone())
     }
 }
 
