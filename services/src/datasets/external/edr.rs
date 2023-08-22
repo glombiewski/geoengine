@@ -72,7 +72,8 @@ pub struct EdrDataProviderDefinition {
 pub struct EdrVectorSpec {
     x: String,
     y: Option<String>,
-    t: String,
+    start_time: String,
+    end_time: Option<String>,
 }
 
 #[typetag::serde]
@@ -636,15 +637,26 @@ impl EdrCollectionMetaData {
         vector_spec: EdrVectorSpec,
         cache_ttl: CacheTtlSeconds,
     ) -> OgrSourceDataset {
+        let time = if vector_spec.end_time.is_some() {
+            OgrSourceDatasetTimeType::StartEnd {
+                start_field: vector_spec.start_time.clone(),
+                start_format: OgrSourceTimeFormat::Auto,
+                end_field: vector_spec.end_time.clone().unwrap(),
+                end_format: OgrSourceTimeFormat::Auto,
+            }
+        } else {
+            OgrSourceDatasetTimeType::Start {
+                start_field: vector_spec.start_time.clone(),
+                start_format: OgrSourceTimeFormat::Auto,
+                duration: OgrSourceDurationSpec::Zero,
+            }
+        };
+
         OgrSourceDataset {
             file_name: download_url.into(),
             layer_name,
             data_type: Some(VectorDataType::MultiLineString),
-            time: OgrSourceDatasetTimeType::Start {
-                start_field: vector_spec.t.clone(),
-                start_format: OgrSourceTimeFormat::Auto,
-                duration: OgrSourceDurationSpec::Zero,
-            },
+            time,
             default_geometry: None,
             columns: Some(self.get_column_spec(vector_spec)),
             force_ogr_time_filter: false,
