@@ -6,7 +6,7 @@
   "vectorSpec": {
     "x": "geometry",
     "y": null,
-    "start_time": "start_time",
-    "end_time": "end_time"
+    "start_time": "start_datetime",
+    "end_time": "end_datetime"
   }
 }
