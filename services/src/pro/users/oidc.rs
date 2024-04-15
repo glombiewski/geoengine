@@ -78,6 +78,7 @@ pub struct OidcRequestDb {
     redirect_uri: String,
     scopes: Vec<String>,
     users: Db<HashMap<String, PendingRequest>>,
+    session_duration_sec: Option<u32>,
     state_function: fn() -> CsrfToken,
     nonce_function: fn() -> Nonce,
 }
@@ -359,7 +360,7 @@ impl OidcRequestDb {
             }?,
         };
 
-        let validity = match token_response.expires_in() {
+        let token_validity = match token_response.expires_in() {
             None => Err(OidcError::ResponseFieldError {
                 field: "duration".to_string(),
                 reason: "missing".to_string(),
@@ -367,7 +368,13 @@ impl OidcRequestDb {
             Some(x) => Ok(x),
         }?;
 
-        Ok((user, Duration::milliseconds(validity.as_millis() as i64))) //TODO: Consider allowing u128 for durations to avoid cast.
+        let session_duration = if let Some(duration) = self.session_duration_sec {
+            Duration::seconds(i64::from(duration))
+        } else {
+            Duration::milliseconds(token_validity.as_millis() as i64)
+        };
+
+        Ok((user, session_duration)) //TODO: Consider allowing u128 for durations to avoid cast.
     }
 
     #[cfg(test)]
@@ -379,6 +386,7 @@ impl OidcRequestDb {
             redirect_uri: value.redirect_uri.to_string(),
             scopes: value.scopes,
             users: Arc::new(Default::default()),
+            session_duration_sec: value.session_duration_sec,
             state_function: || CsrfToken::new(SINGLE_STATE.to_string()),
             nonce_function: || Nonce::new(SINGLE_NONCE.to_string()),
         }
@@ -397,6 +405,7 @@ impl TryFrom<Oidc> for OidcRequestDb {
                 redirect_uri: value.redirect_uri.to_string(),
                 scopes: value.scopes,
                 users: Arc::new(Default::default()),
+                session_duration_sec: value.session_duration_sec,
                 state_function: CsrfToken::new_random,
                 nonce_function: Nonce::new_random,
             };
@@ -423,6 +432,7 @@ mod tests {
         mock_jwks, mock_provider_metadata, mock_token_response, MockTokenConfig, SINGLE_NONCE,
         SINGLE_STATE,
     };
+    use geoengine_datatypes::primitives::Duration;
     use httptest::matchers::request;
     use httptest::responders::status_code;
     use httptest::{Expectation, Server};
@@ -449,6 +459,7 @@ mod tests {
             redirect_uri: REDIRECT_URI.to_string(),
             scopes: vec!["profile".to_string(), "email".to_string()],
             users: Arc::new(Default::default()),
+            session_duration_sec: None,
             state_function: || CsrfToken::new(SINGLE_STATE.to_string()),
             nonce_function: || Nonce::new(SINGLE_NONCE.to_string()),
         }
@@ -462,6 +473,24 @@ mod tests {
             redirect_uri: REDIRECT_URI.to_string(),
             scopes: vec!["profile".to_string(), "email".to_string()],
             users: Arc::new(Default::default()),
+            session_duration_sec: None,
+            state_function: || CsrfToken::new(SINGLE_STATE.to_string()),
+            nonce_function: || Nonce::new(SINGLE_NONCE.to_string()),
+        }
+    }
+
+    fn single_state_nonce_mocked_request_db_with_custom_session(
+        server_url: String,
+        session_duration_sec: u32,
+    ) -> OidcRequestDb {
+        OidcRequestDb {
+            issuer: server_url,
+            client_id: String::new(),
+            client_secret: None,
+            redirect_uri: REDIRECT_URI.to_string(),
+            scopes: vec!["profile".to_string(), "email".to_string()],
+            users: Arc::new(Default::default()),
+            session_duration_sec: Some(session_duration_sec),
             state_function: || CsrfToken::new(SINGLE_STATE.to_string()),
             nonce_function: || Nonce::new(SINGLE_NONCE.to_string()),
         }
@@ -664,6 +693,7 @@ mod tests {
             redirect_uri: REDIRECT_URI.to_string(),
             scopes: vec!["profile".to_string(), "email".to_string()],
             users: Arc::new(Default::default()),
+            session_duration_sec: None,
             state_function: || CsrfToken::new(SINGLE_STATE.to_string()),
             nonce_function: || Nonce::new(SINGLE_NONCE.to_string()),
         };
@@ -1124,6 +1154,44 @@ mod tests {
         let response = request_db.resolve_request(client, auth_code_response).await;
 
         assert!(matches!(response, Err(LoginFailed{reason}) if reason == "Request unknown"));
+    }
+
+    #[tokio::test]
+    async fn resolve_request_success_custom_session_duration() {
+        let server = Server::run();
+        let server_url = format!("http://{}", server.addr());
+        let custom_session_duration_sec = 36000;
+        let request_db = single_state_nonce_mocked_request_db_with_custom_session(
+            server_url,
+            custom_session_duration_sec,
+        );
+        let client = mock_client(&request_db).unwrap();
+
+        request_db.generate_request(client.clone()).await.unwrap();
+
+        let mock_token_config = MockTokenConfig::create_from_issuer_and_client(
+            request_db.issuer.clone(),
+            request_db.client_id.clone(),
+        );
+        assert_ne!(
+            mock_token_config.duration.unwrap().as_secs(),
+            u64::from(custom_session_duration_sec)
+        );
+
+        let token_response = mock_token_response(mock_token_config);
+        mock_valid_request(&server, &token_response);
+
+        let auth_code_response = auth_code_response_empty_with_valid_state();
+        let response = request_db.resolve_request(client, auth_code_response).await;
+
+        assert!(response.is_ok());
+
+        let (_, duration) = response.unwrap();
+
+        assert_eq!(
+            Duration::seconds(i64::from(custom_session_duration_sec)),
+            duration
+        );
     }
 
     //TODO: Did not test code and PKCE verifier.

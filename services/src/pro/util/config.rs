@@ -45,6 +45,7 @@ pub struct Oidc {
     pub client_secret: Option<String>,
     pub redirect_uri: String, //TODO: Maybe URL type
     pub scopes: Vec<String>,
+    pub session_duration_sec: Option<u32>,
 }
 
 impl ConfigElement for Oidc {

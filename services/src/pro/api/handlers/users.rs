@@ -1258,6 +1258,7 @@ mod tests {
             client_secret: None,
             redirect_uri: "https://dummy-redirect.com/".into(),
             scopes: vec!["profile".to_string(), "email".to_string()],
+            session_duration_sec: None,
         };
 
         OidcRequestDb::from_oidc_with_static_tokens(oidc_config)
